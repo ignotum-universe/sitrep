@@ -1,0 +1,21 @@
+{
+  "routes": [
+    {
+      "routePath": "/api/conflicts",
+      "mountPath": "/api",
+      "method": "GET",
+      "module": [
+        "api/conflicts.js:onRequestGet"
+      ]
+    },
+    {
+      "routePath": "/api/scrape-now",
+      "mountPath": "/api",
+      "method": "GET",
+      "module": [
+        "api/scrape-now.js:onRequestGet"
+      ]
+    }
+  ],
+  "baseURL": "/"
+}

@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sitrep — Global Crisis Monitor</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<link rel="stylesheet" href="style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<div id="app">
+  <div id="map"></div>
+
+  <div id="topbar">
+    <div class="brand">
+      <h1>SITREP</h1>
+      <span class="sub">GLOBAL CRISIS MONITOR</span>
+    </div>
+    <div id="clock">
+      <div class="date" id="clockDate">—</div>
+      <div id="clockTime">—</div>
+    </div>
+  </div>
+
+  <div id="panel">
+    <div id="panelToggle">⟩</div>
+    <div id="panelHead">
+      <h2>ACTIVE SIGNALS</h2>
+      <div id="summaryRow"></div>
+    </div>
+    <div id="filters"></div>
+    <div id="feed">
+      <div id="loadingNote">Pulling live feeds from GDACS…</div>
+    </div>
+    <div id="sourceStatus"></div>
+  </div>
+
+  <div id="legend"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(function(){
+  // GEOJSON Globals
+  let countriesLayer = null;
+  let countryGeoJsonData = null; //  Declare global GeoJSON variable
+  let highlightedCountries = [];
+
+  async function loadCountries() {
+    try {
+      const res = await fetch('/countries.geojson');
+      console.log('[countries] fetch status:', res.status, res.url);
+      if (!res.ok) throw new Error('bad status ' + res.status);
+      
+      const geojson = await res.json();
+      countryGeoJsonData = geojson; // Store loaded GeoJSON for geocoding
+
+      console.log('[countries] features loaded:', geojson.features?.length);
+
+      countriesLayer = L.geoJSON(geojson, {
+        style: {
+          fillColor: 'transparent',
+          fillOpacity: 0,
+          color: '#555',
+          weight: 0.5
+        },
+        interactive: false
+      }).addTo(map);
+      console.log('[countries] layer added to map:', !!countriesLayer);
+    } catch (e) {
+      console.error('[countries] failed to load:', e);
+    }
+  }
+
+  function highlightCountries(locationStr) {
+  if (!countriesLayer || !locationStr) {
+    clearCountryHighlights();
+    return;
+  }
+
+  // Clear previous highlights
+  clearCountryHighlights();
+
+  // Normalize location string (applies aliases like 'yemeni' -> 'yemen')
+  const normalizedLoc = normalizeLocationString(locationStr);
+
+  countriesLayer.eachLayer(layer => {
+    const featureName = (
+      layer.feature?.properties?.name ||
+      layer.feature?.properties?.ADMIN ||
+      ''
+    ).toLowerCase().trim();
+
+    if (!featureName) return;
+
+    // Escape regex special characters in the feature name
+    const escapedName = featureName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Word boundary match: ensures "United States" matches as a phrase 
+    // and prevents "united" from matching alone.
+    const nameRegex = new RegExp(`\\b${escapedName}\\b`, 'i');
+
+    if (nameRegex.test(normalizedLoc)) {
+      layer.setStyle({
+        fillColor: '#FF3B30',
+        fillOpacity: 0.35,
+        color: '#FF3B30',
+        weight: 2
+      });
+      layer.bringToFront();
+      highlightedCountries.push(layer);
+    }
+  });
+
+  console.log('[highlight] matched', highlightedCountries.length, 'countries for location:', locationStr);
+}
+
+  function clearCountryHighlights() {
+    highlightedCountries.forEach(layer => {
+      layer.setStyle({
+        fillColor: 'transparent',
+        fillOpacity: 0,
+        color: '#555',
+        weight: 0.5
+      });
+    });
+
+    highlightedCountries = [];
+  }
+
+  // Country Name Alias Map for Adjectives & Variations
+  const COUNTRY_ALIASES = {
+    "yemeni": "yemen",
+    "jamaican": "jamaica",
+    "haitian": "haiti",
+    "sudanese": "sudan",
+    "congolese": "democratic republic of the congo",
+    "dr congo": "democratic republic of the congo",
+    "drc": "democratic republic of the congo",
+    "myanmar": "myanmar",
+    "burma": "myanmar",
+    "palestinian": "palestine",
+    "israeli": "israel",
+    "syrian": "syria",
+    "ukrainian": "ukraine",
+    "russian": "russia",
+    "ethiopian": "ethiopia",
+    "somali": "somalia",
+    "cameroonian": "cameroon",
+  };
+
+  function normalizeLocationString(str) {
+    let normalized = (str || "").toLowerCase();
+    
+    Object.entries(COUNTRY_ALIASES).forEach(([alias, official]) => {
+      if (normalized.includes(alias)) {
+        normalized += ` ${official}`;
+      }
+    });
+    
+    return normalized;
+  }
+
+   const LOCATION_OVERRIDES = [
+    { match: /kashmir/i, coords: [34.0837, 74.7973] },
+    { match: /arab.?israeli|iran.?israel proxy/i, coords: [29.0, 44.5] },
+    { match: /kurdish nationalist/i, coords: [36.1911, 44.0092] },
+]
+
+   function getCoordsFromGeoJson(conflictName, locationStr) {
+    // --- Pass 0: manual overrides for known sub-national/disputed zones ---
+    const override = LOCATION_OVERRIDES.find(o => o.match.test(conflictName));
+    if (override) return override.coords;
+ 
+    const combinedText = normalizeLocationString(`${conflictName} ${locationStr}`);
+ 
+    if (countryGeoJsonData && countryGeoJsonData.features) {
+      // --- Pass 1: word-boundary full-name match, earliest position wins ---
+      let bestMatch = null; // { index, feature }
+ 
+      for (const feature of countryGeoJsonData.features) {
+        const countryName = (feature.properties?.name || "").toLowerCase().trim();
+        if (!countryName) continue;
+ 
+        const escapedName = countryName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const nameRegex = new RegExp(`\\b${escapedName}\\b`, 'i');
+        const match = nameRegex.exec(combinedText);
+ 
+        if (match && (!bestMatch || match.index < bestMatch.index)) {
+          bestMatch = { index: match.index, feature };
+        }
+      }
+ 
+      if (bestMatch) {
+        const geoLayer = L.geoJSON(bestMatch.feature);
+        const center = geoLayer.getBounds().getCenter();
+ 
+        const latOffset = (Math.random() - 0.5) * 0.5;
+        const lngOffset = (Math.random() - 0.5) * 0.5;
+ 
+        return [center.lat + latOffset, center.lng + lngOffset];
+      }
+ 
+      // --- Pass 2: tokenized iso2/iso3 fallback, earliest position wins ---
+      const tokenMatches = []; // { index, token }
+      const tokenRegex = /[a-z0-9]+/gi;
+      let m;
+      while ((m = tokenRegex.exec(combinedText)) !== null) {
+        tokenMatches.push({ index: m.index, token: m[0].toLowerCase() });
+      }
+ 
+      let bestTokenMatch = null; // { index, feature }
+      for (const feature of countryGeoJsonData.features) {
+        const iso2 = (feature.properties?.["ISO3166-1-Alpha-2"] || "").toLowerCase();
+        const iso3 = (feature.properties?.["ISO3166-1-Alpha-3"] || "").toLowerCase();
+        if (!iso2 && !iso3) continue;
+ 
+        const hit = tokenMatches.find(t => t.token === iso2 || t.token === iso3);
+        if (hit && (!bestTokenMatch || hit.index < bestTokenMatch.index)) {
+          bestTokenMatch = { index: hit.index, feature };
+        }
+      }
+ 
+      if (bestTokenMatch) {
+        const geoLayer = L.geoJSON(bestTokenMatch.feature);
+        const center = geoLayer.getBounds().getCenter();
+ 
+        const latOffset = (Math.random() - 0.5) * 0.5;
+        const lngOffset = (Math.random() - 0.5) * 0.5;
+ 
+        return [center.lat + latOffset, center.lng + lngOffset];
+      }
+    }
+ 
+    if (combinedText.includes("jamaica")) return [18.1096, -77.2975];
+    if (combinedText.includes("haiti")) return [18.9712, -72.2852];
+ 
+    return [20, 0];
+  }
+
+  // ---------- Setup Map ----------
+  const map = L.map('map', {
+    zoomControl: false,
+    worldCopyJump: true,
+    minZoom: 2,
+  }).setView([15, 10], 3);
+
+  L.control.zoom({position:'bottomright'}).addTo(map);
+
+  const tileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors',
+    subdomains: 'abc',
+    maxZoom: 18,
+  }).addTo(map);
+
+  function fixMapSize(){ map.invalidateSize(); }
+  window.addEventListener('load', fixMapSize);
+  window.addEventListener('resize', fixMapSize);
+  setTimeout(fixMapSize, 300);
+  setTimeout(fixMapSize, 1200);
+
+  tileLayer.on('tileerror', () => {
+    const note = document.getElementById('loadingNote');
+    if(note && document.getElementById('feed').children.length <= 1){
+      note.textContent = 'Map tiles failed to load from this environment.';
+    }
+  });
+
+  const CATS = {
+    quake: { label: 'Earthquakes', color: '#F2A65A' },
+    storm: { label: 'Storms & floods', color: '#5AC8FA' },
+    conflict: { label: 'Armed Conflicts', color: '#FF3B30' },
+  };
+
+  let events = [];
+  let markers = [];
+  const activeCats = new Set(Object.keys(CATS));
+
+  function addEvent(ev){
+    events.push(ev);
+  }
+
+  function timeAgo(dateStr){
+    if(!dateStr) return '';
+    const d = new Date(dateStr);
+    if(isNaN(d)) return '';
+    const diffMs = Date.now() - d.getTime();
+    const h = Math.floor(diffMs / 3600000);
+    if(h < 1) return 'just now';
+    if(h < 24) return h + 'h ago';
+    return Math.floor(h/24) + 'd ago';
+  }
+
+  // ---------- Render ----------
+  function render(){
+    markers.forEach(m => map.removeLayer(m));
+    markers = [];
+    const feedEl = document.getElementById('feed');
+    feedEl.innerHTML = '';
+
+    const visible = events
+      .filter(e => activeCats.has(e.cat))
+      .sort((a,b) => new Date(b.date||0) - new Date(a.date||0));
+
+    if(visible.length === 0){
+      feedEl.innerHTML = '<div id="loadingNote">No signals match the current filters.</div>';
+    }
+
+    visible.forEach(ev => {
+      const color = CATS[ev.cat].color;
+      const radius = ev.magnitude ? Math.max(4, ev.magnitude * 2.2) : 6;
+
+      const marker = L.circleMarker([ev.lat, ev.lng], {
+        radius: radius,
+        color: color,
+        weight: 1.5,
+        fillColor: color,
+        fillOpacity: 0.35,
+        opacity: 0.9,
+      }).addTo(map);
+
+      marker.bindPopup(`
+  <div class="pop-title">${escapeHtml(ev.title)}</div>
+  
+  ${ev.fatalities !== undefined ? `<div class="pop-row">Fatalities: ${escapeHtml(ev.fatalities)}</div>` : ''}
+  ${ev.location ? `<div class="pop-row">Location: ${escapeHtml(ev.location)}</div>` : ''}
+  ${!ev.fatalities && ev.subtitle ? `<div class="pop-row">${escapeHtml(ev.subtitle)}</div>` : ''}
+  
+  <div class="pop-row">Last Updated: ${ev.date ? new Date(ev.date).toUTCString() : ''}</div>
+`);
+
+      marker.on('click', () => {
+        if (ev.cat === 'conflict') {
+          highlightCountries(ev.location);
+        } else {
+          clearCountryHighlights();
+        }
+      });
+      markers.push(marker);
+
+      const item = document.createElement('div');
+      item.className = 'feed-item';
+      item.innerHTML = `
+        <div class="feed-marker" style="background:${color}"></div>
+        <div class="feed-body">
+          <div class="feed-title">${escapeHtml(ev.title)}</div>
+          <div class="feed-meta">
+            <span>${escapeHtml(ev.subtitle||'')}</span>
+            <span>Last Updated: ${timeAgo(ev.date)}</span>
+          </div>
+        </div>
+      `;
+      item.addEventListener('click', () => {
+        map.flyTo([ev.lat, ev.lng], Math.max(map.getZoom(), 5), {duration:0.6});
+        marker.openPopup();
+        if (ev.cat === 'conflict') {
+          highlightCountries(ev.location);
+        } else {
+          clearCountryHighlights();
+        }
+      });
+      feedEl.appendChild(item);
+    });
+
+    renderSummary(visible);
+  }
+
+  function renderSummary(visible){
+    const el = document.getElementById('summaryRow');
+    el.innerHTML = `
+      <div class="stat"><div class="n">${visible.length}</div><div class="l">TOTAL</div></div>
+      <div class="stat"><div class="n">${visible.filter(e=>e.level==='high').length}</div><div class="l">HIGH ALERT</div></div>
+    `;
+  }
+
+  function escapeHtml(str){
+    return String(str||'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  }
+
+  // ---------- Filters & UI ----------
+  function buildFilters(){
+    const el = document.getElementById('filters');
+    el.innerHTML = '';
+    Object.entries(CATS).forEach(([key, def]) => {
+      const chip = document.createElement('div');
+      chip.className = 'filter-chip active';
+      chip.dataset.cat = key;
+      chip.innerHTML = `<span class="dot" style="background:${def.color}"></span>${def.label}`;
+      chip.addEventListener('click', () => {
+        if(activeCats.has(key)){ activeCats.delete(key); chip.classList.remove('active'); }
+        else { activeCats.add(key); chip.classList.add('active'); }
+        render();
+      });
+      el.appendChild(chip);
+    });
+  }
+
+  function buildLegend(){
+    const el = document.getElementById('legend');
+    el.innerHTML = Object.entries(CATS).map(([k,def]) =>
+      `<div class="li"><span class="dot" style="background:${def.color}"></span>${def.label}</div>`
+    ).join('');
+  }
+
+  document.getElementById('panelToggle').addEventListener('click', () => {
+    const panel = document.getElementById('panel');
+    const toggle = document.getElementById('panelToggle');
+    panel.classList.toggle('collapsed');
+    toggle.textContent = panel.classList.contains('collapsed') ? '⟨' : '⟩';
+  });
+
+  function tickClock(){
+    const now = new Date();
+    document.getElementById('clockDate').textContent = now.toLocaleDateString('en-US', {weekday:'short', month:'short', day:'numeric', year:'numeric', timeZone:'UTC'});
+    document.getElementById('clockTime').textContent = now.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit', second:'2-digit', timeZone:'UTC', hour12:false}) + ' UTC';
+  }
+  tickClock();
+  setInterval(tickClock, 1000);
+
+  const sources = {
+    gdacs: { label: 'GDACS — Multi-hazard', state: 'pending' },
+    conflicts: { label: 'D1 — Conflict Database', state: 'pending' },
+  };
+
+  function renderSourceStatus(){
+    const el = document.getElementById('sourceStatus');
+    el.innerHTML = Object.values(sources).map(s => `
+      <div class="row">
+        <span>${s.label}</span>
+        <span class="src-state"><span class="src-dot ${s.state}"></span>${s.state === 'ok' ? 'live' : s.state === 'err' ? 'unavailable' : 'loading'}</span>
+      </div>
+    `).join('');
+  }
+
+  renderSourceStatus();
+
+  // ---------- GDACS Fetch ----------
+  async function fetchGDACS(){
+    try{
+      const res = await fetch('https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH');
+      if(!res.ok) throw new Error('bad status ' + res.status);
+      const data = await res.json();
+      const feats = data.features || data || [];
+      const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+
+      feats.forEach((f, i) => {
+        const p = f.properties || f;
+        const geom = f.geometry;
+        if(!geom || !geom.coordinates) return;
+
+        const isCurrent = p.iscurrent === 'true' || p.iscurrent === true;
+        const lastActive = new Date(p.todate || p.datemodified || p.fromdate || 0).getTime();
+        if(!isCurrent && lastActive < cutoff) return;
+
+        const alertLevel = (p.alertlevel || p.episodealertlevel || '').toLowerCase();
+        const isQuake = p.eventtype === 'EQ';
+        if(isQuake && alertLevel === 'green') return;
+
+        const lng = geom.coordinates[0], lat = geom.coordinates[1];
+        const level = alertLevel === 'red' ? 'high' : alertLevel === 'orange' ? 'medium' : 'low';
+        const magnitude = isQuake ? p.severitydata && p.severitydata.severity : null;
+
+        addEvent({
+          id: 'gdacs-' + (p.eventid || i) + '-' + (p.episodeid || ''),
+          cat: isQuake ? 'quake' : 'storm',
+          title: p.name || p.eventname || (p.eventtype ? p.eventtype + ' event' : 'GDACS event'),
+          subtitle: isQuake
+            ? `${p.severitydata ? p.severitydata.severitytext : ''} · ${p.country || p.iso3 || ''} · ${alertLevel.toUpperCase()} alert`
+            : `${(p.eventtype||'').toUpperCase()} · ${p.country || p.iso3 || ''} · ${alertLevel.toUpperCase()} alert`,
+          lat, lng, magnitude, level,
+          date: p.datemodified || p.fromdate || p.todate,
+          source: 'GDACS',
+        });
+      });
+      sources.gdacs.state = 'ok';
+    }catch(e){
+      sources.gdacs.state = 'err';
+      console.error('GDACS fetch failed', e);
+    }
+    renderSourceStatus();
+    render();
+  }
+
+  // ---------- Conflicts Fetch ----------
+  async function fetchConflicts() {
+    try {
+      const res = await fetch('/api/conflicts');
+
+      console.log('[conflicts] HTTP status:', res.status);
+      console.log('[conflicts] URL:', res.url);
+
+      if (!res.ok) {
+        throw new Error(`Failed to load conflicts: ${res.status}`);
+      }
+
+      const payload = await res.json();
+      const records = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload.data)
+          ? payload.data
+          : [];
+
+      records.forEach((c, i) => {
+  const [lat, lng] = getCoordsFromGeoJson(c.name, c.location);
+
+  addEvent({
+    id: 'd1-conflict-' + i,
+    cat: 'conflict',
+    title: c.name,
+    fatalities: c.cumulative_deaths || 'N/A', // Separate subtitles
+    location: c.location || c.name,            // Separate subtitles
+    subtitle: `Fatalities: ${c.cumulative_deaths || 'N/A'}`, //  side feed
+    lat,
+    lng,
+    magnitude: 5,
+    level: 'high',
+    date: payload.last_updated || new Date().toISOString(),
+  });
+});
+
+      sources.conflicts.state = 'ok';
+
+    } catch (e) {
+      sources.conflicts.state = 'err';
+      console.error('[conflicts] fetch failed:', e);
+    }
+
+    renderSourceStatus();
+    render();
+  }
+
+  function refreshAll(){
+    events = [];
+    sources.gdacs.state = 'pending';
+    sources.conflicts.state = 'pending';
+    renderSourceStatus();
+    render();
+
+    Promise.allSettled([fetchGDACS(), fetchConflicts()]).then(() => {
+      const note = document.getElementById('loadingNote');
+      if(events.length === 0 && note){
+        note.textContent = 'No live signals loaded. Check browser network access.';
+      }
+    });
+  }
+
+  // ---------- Init ----------
+  buildFilters();
+  buildLegend();
+  
+  // Ensure GeoJSON loads before or in parallel with conflicts
+  loadCountries().then(() => {
+    refreshAll();
+  });
+
+  setInterval(refreshAll, 5 * 60 * 1000);
+
+})();
+</script>
+</body>
+</html>
